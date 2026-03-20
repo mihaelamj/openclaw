@@ -1,1 +1,1 @@
-AGENTS.md
+mihaela-agents/Rules/CLAUDE.md
