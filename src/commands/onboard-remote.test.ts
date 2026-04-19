@@ -3,14 +3,17 @@ import type { OpenClawConfig } from "../config/config.js";
 import type { GatewayBonjourBeacon } from "../infra/bonjour-discovery.js";
 import { captureEnv } from "../test-utils/env.js";
 import type { WizardPrompter } from "../wizard/prompts.js";
+import { promptRemoteGatewayConfig } from "./onboard-remote.js";
 import { createWizardPrompter } from "./test-wizard-helpers.js";
 
 const discoverGatewayBeacons = vi.hoisted(() => vi.fn<() => Promise<GatewayBonjourBeacon[]>>());
 const resolveWideAreaDiscoveryDomain = vi.hoisted(() => vi.fn(() => undefined));
 const detectBinary = vi.hoisted(() => vi.fn<(name: string) => Promise<boolean>>());
 
-vi.mock("../infra/bonjour-discovery.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../infra/bonjour-discovery.js")>();
+vi.mock("../infra/bonjour-discovery.js", async () => {
+  const actual = await vi.importActual<typeof import("../infra/bonjour-discovery.js")>(
+    "../infra/bonjour-discovery.js",
+  );
   return {
     ...actual,
     discoverGatewayBeacons,
@@ -24,8 +27,6 @@ vi.mock("../infra/widearea-dns.js", () => ({
 vi.mock("./onboard-helpers.js", () => ({
   detectBinary,
 }));
-
-const { promptRemoteGatewayConfig } = await import("./onboard-remote.js");
 
 function createPrompter(overrides: Partial<WizardPrompter>): WizardPrompter {
   return createWizardPrompter(overrides, { defaultSelect: "" });
@@ -41,6 +42,16 @@ function createSelectPrompter(
     }
     return (params.options[0]?.value ?? "") as never;
   });
+}
+
+function createGatewayDiscoveryBeacon(): GatewayBonjourBeacon {
+  return {
+    instanceName: "gateway",
+    displayName: "Gateway",
+    host: "gateway.tailnet.ts.net",
+    port: 18789,
+    gatewayTlsFingerprintSha256: "sha256:abc123",
+  };
 }
 
 describe("promptRemoteGatewayConfig", () => {
@@ -77,15 +88,7 @@ describe("promptRemoteGatewayConfig", () => {
 
   it("defaults discovered direct remote URLs to wss://", async () => {
     detectBinary.mockResolvedValue(true);
-    discoverGatewayBeacons.mockResolvedValue([
-      {
-        instanceName: "gateway",
-        displayName: "Gateway",
-        host: "gateway.tailnet.ts.net",
-        port: 18789,
-        gatewayTlsFingerprintSha256: "sha256:abc123",
-      },
-    ]);
+    discoverGatewayBeacons.mockResolvedValue([createGatewayDiscoveryBeacon()]);
 
     const text: WizardPrompter["text"] = vi.fn(async (params) => {
       if (params.message === "Gateway WebSocket URL") {
@@ -119,7 +122,7 @@ describe("promptRemoteGatewayConfig", () => {
     );
   });
 
-  it("rejects discovery endpoint when trust confirmation is declined", async () => {
+  it("falls back to manual URL entry when discovery trust is declined", async () => {
     detectBinary.mockResolvedValue(true);
     discoverGatewayBeacons.mockResolvedValue([
       {
@@ -135,6 +138,14 @@ describe("promptRemoteGatewayConfig", () => {
       "Select gateway": "0",
       "Connection method": "direct",
     });
+    const manualUrl = "wss://manual.example.com:18789";
+    const text: WizardPrompter["text"] = vi.fn(async (params) => {
+      if (params.message === "Gateway WebSocket URL") {
+        expect(params.initialValue).toBe("ws://127.0.0.1:18789");
+        return manualUrl;
+      }
+      return "";
+    }) as WizardPrompter["text"];
     const confirm: WizardPrompter["confirm"] = vi.fn(async (params) => {
       if (params.message.startsWith("Discover gateway")) {
         return true;
@@ -148,12 +159,14 @@ describe("promptRemoteGatewayConfig", () => {
     const prompter = createPrompter({
       confirm,
       select,
-      text: vi.fn(async () => "") as WizardPrompter["text"],
+      text,
     });
 
-    await expect(promptRemoteGatewayConfig({} as OpenClawConfig, prompter)).rejects.toThrow(
-      "not trusted",
-    );
+    const next = await promptRemoteGatewayConfig({} as OpenClawConfig, prompter);
+
+    expect(next.gateway?.mode).toBe("remote");
+    expect(next.gateway?.remote?.url).toBe(manualUrl);
+    expect(next.gateway?.remote?.tlsFingerprint).toBeUndefined();
   });
 
   it("trusts discovery endpoint without fingerprint and omits tlsFingerprint", async () => {
@@ -190,15 +203,7 @@ describe("promptRemoteGatewayConfig", () => {
 
   it("drops discovery tlsFingerprint when the URL is edited after trust confirmation", async () => {
     detectBinary.mockResolvedValue(true);
-    discoverGatewayBeacons.mockResolvedValue([
-      {
-        instanceName: "gateway",
-        displayName: "Gateway",
-        host: "gateway.tailnet.ts.net",
-        port: 18789,
-        gatewayTlsFingerprintSha256: "sha256:abc123",
-      },
-    ]);
+    discoverGatewayBeacons.mockResolvedValue([createGatewayDiscoveryBeacon()]);
 
     const text: WizardPrompter["text"] = vi.fn(async (params) => {
       if (params.message === "Gateway WebSocket URL") {

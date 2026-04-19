@@ -14,8 +14,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { RateLimitError, type RequestClient } from "@buape/carbon";
-import type { RetryRunner } from "openclaw/plugin-sdk/infra-runtime";
-import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/infra-runtime";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import {
   parseFfprobeCodecAndSampleRate,
   runFfmpeg,
@@ -23,11 +22,32 @@ import {
 } from "openclaw/plugin-sdk/media-runtime";
 import { MEDIA_FFMPEG_MAX_AUDIO_DURATION_SECS } from "openclaw/plugin-sdk/media-runtime";
 import { unlinkIfExists } from "openclaw/plugin-sdk/media-runtime";
+import type { RetryRunner } from "openclaw/plugin-sdk/retry-runtime";
+import { resolvePreferredOpenClawTmpDir } from "openclaw/plugin-sdk/temp-path";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/text-runtime";
 
 const DISCORD_VOICE_MESSAGE_FLAG = 1 << 13;
 const SUPPRESS_NOTIFICATIONS_FLAG = 1 << 12;
 const WAVEFORM_SAMPLES = 256;
 const DISCORD_OPUS_SAMPLE_RATE_HZ = 48_000;
+
+function createRateLimitError(
+  response: Response,
+  body: { message: string; retry_after: number; global: boolean },
+  request?: Request,
+): RateLimitError {
+  const compatRequest =
+    request ??
+    new Request("https://discord.com/api/v10/channels/voice/messages", {
+      method: "POST",
+    });
+  const RateLimitErrorCtor = RateLimitError as unknown as new (
+    response: Response,
+    body: { message: string; retry_after: number; global: boolean },
+    request?: Request,
+  ) => RateLimitError;
+  return new RateLimitErrorCtor(response, body, compatRequest);
+}
 
 export type VoiceMessageMetadata = {
   durationSecs: number;
@@ -54,7 +74,7 @@ export async function getAudioDuration(filePath: string): Promise<number> {
     }
     return Math.round(duration * 100) / 100; // Round to 2 decimal places
   } catch (err) {
-    const errMessage = err instanceof Error ? err.message : String(err);
+    const errMessage = formatErrorMessage(err);
     throw new Error(`Failed to get audio duration: ${errMessage}`, { cause: err });
   }
 }
@@ -160,7 +180,7 @@ export async function ensureOggOpus(filePath: string): Promise<{ path: string; c
     );
   }
 
-  const ext = path.extname(filePath).toLowerCase();
+  const ext = normalizeLowercaseStringOrEmpty(path.extname(filePath));
 
   // Check if already OGG
   if (ext === ".ogg") {
@@ -283,15 +303,11 @@ export async function sendDiscordVoiceMessage(
           retry_after?: number;
           global?: boolean;
         };
-        throw new RateLimitError(
-          res,
-          {
-            message: retryData.message ?? "You are being rate limited.",
-            retry_after: retryData.retry_after ?? 1,
-            global: retryData.global ?? false,
-          },
-          uploadUrlRequest,
-        );
+        throw createRateLimitError(res, {
+          message: retryData.message ?? "You are being rate limited.",
+          retry_after: retryData.retry_after ?? 1,
+          global: retryData.global ?? false,
+        });
       }
       const errorBody = (await res.json().catch(() => null)) as {
         code?: number;

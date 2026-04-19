@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "../config/config.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { SecretInput } from "../config/types.secrets.js";
 import { isSecureWebSocketUrl } from "../gateway/net.js";
 import { discoverGatewayBeacons, type GatewayBonjourBeacon } from "../infra/bonjour-discovery.js";
@@ -93,7 +93,7 @@ export async function promptRemoteGatewayConfig(
         ],
       });
       if (selection !== "manual") {
-        const idx = Number.parseInt(String(selection), 10);
+        const idx = Number.parseInt(selection, 10);
         selectedBeacon = Number.isFinite(idx) ? (beacons[idx] ?? null) : null;
       }
     }
@@ -120,22 +120,22 @@ export async function promptRemoteGatewayConfig(
           message: `Trust this gateway? Host: ${host}:${port} TLS fingerprint: ${fingerprint ?? "not advertised (connection will not be pinned)"}`,
           initialValue: false,
         });
-        if (!trusted) {
-          throw new Error(
-            `Discovery endpoint ${host}:${port} not trusted. Re-run onboarding or enter the URL manually.`,
+        if (trusted) {
+          discoveryTlsFingerprint = fingerprint;
+          trustedDiscoveryUrl = suggestedUrl;
+          await prompter.note(
+            [
+              "Direct remote access defaults to TLS.",
+              `Using: ${suggestedUrl}`,
+              ...(fingerprint ? [`TLS pin: ${fingerprint}`] : []),
+              "If your gateway is loopback-only, choose SSH tunnel and keep ws://127.0.0.1:18789.",
+            ].join("\n"),
+            "Direct remote",
           );
+        } else {
+          // Clear the discovered endpoint so the manual prompt falls back to a safe default.
+          suggestedUrl = DEFAULT_GATEWAY_URL;
         }
-        discoveryTlsFingerprint = fingerprint;
-        trustedDiscoveryUrl = suggestedUrl;
-        await prompter.note(
-          [
-            "Direct remote access defaults to TLS.",
-            `Using: ${suggestedUrl}`,
-            ...(fingerprint ? [`TLS pin: ${fingerprint}`] : []),
-            "If your gateway is loopback-only, choose SSH tunnel and keep ws://127.0.0.1:18789.",
-          ].join("\n"),
-          "Direct remote",
-        );
       } else {
         suggestedUrl = DEFAULT_GATEWAY_URL;
         await prompter.note(
@@ -153,9 +153,9 @@ export async function promptRemoteGatewayConfig(
   const urlInput = await prompter.text({
     message: "Gateway WebSocket URL",
     initialValue: suggestedUrl,
-    validate: (value) => validateGatewayWebSocketUrl(String(value)),
+    validate: (value) => validateGatewayWebSocketUrl(value),
   });
-  const url = ensureWsUrl(String(urlInput));
+  const url = ensureWsUrl(urlInput);
   const pinnedDiscoveryFingerprint =
     discoveryTlsFingerprint && url === trustedDiscoveryUrl ? discoveryTlsFingerprint : undefined;
 
@@ -193,12 +193,12 @@ export async function promptRemoteGatewayConfig(
       });
       token = resolved.ref;
     } else {
-      token = String(
+      token = (
         await prompter.text({
           message: "Gateway token",
           initialValue: typeof token === "string" ? token : undefined,
           validate: (value) => (value?.trim() ? undefined : "Required"),
-        }),
+        })
       ).trim();
     }
     password = undefined;
@@ -225,12 +225,12 @@ export async function promptRemoteGatewayConfig(
       });
       password = resolved.ref;
     } else {
-      password = String(
+      password = (
         await prompter.text({
           message: "Gateway password",
           initialValue: typeof password === "string" ? password : undefined,
           validate: (value) => (value?.trim() ? undefined : "Required"),
-        }),
+        })
       ).trim();
     }
     token = undefined;

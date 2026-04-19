@@ -1,12 +1,17 @@
+import fs from "node:fs/promises";
+import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import {
   createSubsystemLogger,
+  resolveAgentWorkspaceDir,
   resolveGlobalSingleton,
   type OpenClawConfig,
 } from "openclaw/plugin-sdk/memory-core-host-engine-foundation";
+import { checkQmdBinaryAvailability } from "openclaw/plugin-sdk/memory-core-host-engine-qmd";
 import {
   resolveMemoryBackendConfig,
   type MemoryEmbeddingProbeResult,
   type MemorySearchManager,
+  type MemorySearchRuntimeDebug,
   type MemorySyncProgressUpdate,
   type ResolvedQmdConfig,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
@@ -28,11 +33,17 @@ function getMemorySearchManagerCacheStore(): MemorySearchManagerCacheStore {
 
 const log = createSubsystemLogger("memory");
 const { qmdManagerCache: QMD_MANAGER_CACHE } = getMemorySearchManagerCacheStore();
-let managerRuntimePromise: Promise<typeof import("./manager-runtime.js")> | null = null;
+let managerRuntimePromise: Promise<typeof import("../../manager-runtime.js")> | null = null;
+let qmdManagerModulePromise: Promise<typeof import("./qmd-manager.js")> | null = null;
 
 function loadManagerRuntime() {
-  managerRuntimePromise ??= import("./manager-runtime.js");
+  managerRuntimePromise ??= import("../../manager-runtime.js");
   return managerRuntimePromise;
+}
+
+function loadQmdManagerModule() {
+  qmdManagerModulePromise ??= import("./qmd-manager.js");
+  return qmdManagerModulePromise;
 }
 
 export type MemorySearchManagerResult = {
@@ -63,45 +74,75 @@ export async function getMemorySearchManager(params: {
         return { manager: new BorrowedMemoryManager(fullCached) };
       }
     }
+
+    const workspaceDir = resolveAgentWorkspaceDir(params.cfg, params.agentId);
     try {
-      const { QmdMemoryManager } = await import("./qmd-manager.js");
-      const primary = await QmdMemoryManager.create({
-        cfg: params.cfg,
-        agentId: params.agentId,
-        resolved,
-        mode: statusOnly ? "status" : "full",
-      });
-      if (primary) {
-        if (statusOnly) {
-          return { manager: primary };
-        }
-        const wrapper = new FallbackMemoryManager(
-          {
-            primary,
-            fallbackFactory: async () => {
-              const { MemoryIndexManager } = await loadManagerRuntime();
-              return await MemoryIndexManager.get(params);
-            },
-          },
-          () => {
-            QMD_MANAGER_CACHE.delete(cacheKey);
-          },
-        );
-        QMD_MANAGER_CACHE.set(cacheKey, wrapper);
-        return { manager: wrapper };
-      }
+      await fs.mkdir(workspaceDir, { recursive: true });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      log.warn(`qmd memory unavailable; falling back to builtin: ${message}`);
+      log.warn(
+        `qmd workspace unavailable (${workspaceDir}); falling back to builtin: ${formatErrorMessage(err)}`,
+      );
+      return await getBuiltinMemorySearchManager(params);
+    }
+
+    const qmdBinary = await checkQmdBinaryAvailability({
+      command: resolved.qmd.command,
+      env: process.env,
+      cwd: workspaceDir,
+    });
+    if (!qmdBinary.available) {
+      log.warn(
+        `qmd binary unavailable (${resolved.qmd.command}); falling back to builtin: ${qmdBinary.error ?? "unknown error"}`,
+      );
+    } else {
+      try {
+        const { QmdMemoryManager } = await loadQmdManagerModule();
+        const primary = await QmdMemoryManager.create({
+          cfg: params.cfg,
+          agentId: params.agentId,
+          resolved,
+          mode: statusOnly ? "status" : "full",
+        });
+        if (primary) {
+          if (statusOnly) {
+            return { manager: primary };
+          }
+          const wrapper = new FallbackMemoryManager(
+            {
+              primary,
+              fallbackFactory: async () => {
+                const { MemoryIndexManager } = await loadManagerRuntime();
+                return await MemoryIndexManager.get(params);
+              },
+            },
+            () => {
+              QMD_MANAGER_CACHE.delete(cacheKey);
+            },
+          );
+          QMD_MANAGER_CACHE.set(cacheKey, wrapper);
+          return { manager: wrapper };
+        }
+      } catch (err) {
+        const message = formatErrorMessage(err);
+        log.warn(`qmd memory unavailable; falling back to builtin: ${message}`);
+      }
     }
   }
 
+  return await getBuiltinMemorySearchManager(params);
+}
+
+async function getBuiltinMemorySearchManager(params: {
+  cfg: OpenClawConfig;
+  agentId: string;
+  purpose?: "default" | "status";
+}): Promise<MemorySearchManagerResult> {
   try {
     const { MemoryIndexManager } = await loadManagerRuntime();
     const manager = await MemoryIndexManager.get(params);
     return { manager };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = formatErrorMessage(err);
     return { manager: null, error: message };
   }
 }
@@ -111,7 +152,13 @@ class BorrowedMemoryManager implements MemorySearchManager {
 
   async search(
     query: string,
-    opts?: { maxResults?: number; minScore?: number; sessionKey?: string },
+    opts?: {
+      maxResults?: number;
+      minScore?: number;
+      sessionKey?: string;
+      qmdSearchModeOverride?: "query" | "search" | "vsearch";
+      onDebug?: (debug: MemorySearchRuntimeDebug) => void;
+    },
   ) {
     return await this.inner.search(query, opts);
   }
@@ -176,14 +223,20 @@ class FallbackMemoryManager implements MemorySearchManager {
 
   async search(
     query: string,
-    opts?: { maxResults?: number; minScore?: number; sessionKey?: string },
+    opts?: {
+      maxResults?: number;
+      minScore?: number;
+      sessionKey?: string;
+      qmdSearchModeOverride?: "query" | "search" | "vsearch";
+      onDebug?: (debug: MemorySearchRuntimeDebug) => void;
+    },
   ) {
     if (!this.primaryFailed) {
       try {
         return await this.deps.primary.search(query, opts);
       } catch (err) {
         this.primaryFailed = true;
-        this.lastError = err instanceof Error ? err.message : String(err);
+        this.lastError = formatErrorMessage(err);
         log.warn(`qmd memory failed; switching to builtin index: ${this.lastError}`);
         await this.deps.primary.close?.().catch(() => {});
         // Evict the failed wrapper so the next request can retry QMD with a fresh manager.
@@ -288,7 +341,7 @@ class FallbackMemoryManager implements MemorySearchManager {
         return null;
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = formatErrorMessage(err);
       log.warn(`memory fallback unavailable: ${message}`);
       return null;
     }

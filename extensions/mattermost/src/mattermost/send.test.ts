@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   expectProvidedCfgSkipsRuntimeLoad,
   expectRuntimeCfgFallback,
-} from "../../../../test/helpers/extensions/send-config.js";
+} from "../../../../test/helpers/plugins/send-config.js";
 
 let parseMattermostTarget: typeof import("./send.js").parseMattermostTarget;
 let sendMessageMattermost: typeof import("./send.js").sendMessageMattermost;
@@ -15,6 +15,7 @@ type SendMessageMattermostOptions = NonNullable<
 const mockState = vi.hoisted(() => ({
   loadConfig: vi.fn(() => ({})),
   loadOutboundMediaFromUrl: vi.fn(),
+  recordActivity: vi.fn(),
   resolveMattermostAccount: vi.fn(() => ({
     accountId: "default",
     botToken: "bot-token",
@@ -36,6 +37,38 @@ const mockState = vi.hoisted(() => ({
 
 vi.mock("../../runtime-api.js", () => ({
   loadOutboundMediaFromUrl: mockState.loadOutboundMediaFromUrl,
+}));
+
+vi.mock("openclaw/plugin-sdk/config-runtime", () => ({
+  resolveMarkdownTableMode: vi.fn(() => "off"),
+}));
+
+vi.mock("openclaw/plugin-sdk/text-runtime", () => ({
+  convertMarkdownTables: vi.fn((text: string) => text),
+  normalizeLowercaseStringOrEmpty: vi.fn((value: string | null | undefined) => {
+    if (typeof value !== "string") {
+      return "";
+    }
+    return value.trim().toLowerCase();
+  }),
+  normalizeOptionalString: vi.fn((value: string | null | undefined) => {
+    if (typeof value !== "string") {
+      return undefined;
+    }
+    const normalized = value.trim();
+    return normalized.length > 0 ? normalized : undefined;
+  }),
+  normalizeStringifiedOptionalString: vi.fn((value: unknown) => {
+    if (typeof value === "string") {
+      const normalized = value.trim();
+      return normalized.length > 0 ? normalized : undefined;
+    }
+    if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
+      const normalized = String(value).trim();
+      return normalized.length > 0 ? normalized : undefined;
+    }
+    return undefined;
+  }),
 }));
 
 vi.mock("./accounts.js", () => ({
@@ -71,7 +104,7 @@ vi.mock("../runtime.js", () => ({
         convertMarkdownTables: (text: string) => text,
       },
       activity: {
-        record: vi.fn(),
+        record: mockState.recordActivity,
       },
     },
   }),
@@ -82,6 +115,7 @@ describe("sendMessageMattermost", () => {
     vi.resetModules();
     mockState.loadConfig.mockReset();
     mockState.loadConfig.mockReturnValue({});
+    mockState.recordActivity.mockReset();
     mockState.resolveMattermostAccount.mockReset();
     mockState.resolveMattermostAccount.mockReturnValue({
       accountId: "default",
@@ -168,6 +202,36 @@ describe("sendMessageMattermost", () => {
       cfg: runtimeCfg,
       accountId: undefined,
     });
+  });
+
+  it("sends with provided cfg even when the runtime store is not initialized", async () => {
+    const providedCfg = {
+      channels: {
+        mattermost: {
+          botToken: "provided-token",
+        },
+      },
+    };
+    mockState.resolveMattermostAccount.mockReturnValue({
+      accountId: "work",
+      botToken: "provided-token",
+      baseUrl: "https://mattermost.example.com",
+      config: {},
+    });
+    mockState.recordActivity.mockImplementation(() => {
+      throw new Error("Mattermost runtime not initialized");
+    });
+
+    await expect(
+      sendMessageMattermost("channel:town-square", "hello", {
+        cfg: providedCfg,
+        accountId: "work",
+      }),
+    ).resolves.toEqual({
+      messageId: "post-1",
+      channelId: "town-square",
+    });
+    expect(mockState.loadConfig).not.toHaveBeenCalled();
   });
 
   it("loads outbound media with trusted local roots before upload", async () => {

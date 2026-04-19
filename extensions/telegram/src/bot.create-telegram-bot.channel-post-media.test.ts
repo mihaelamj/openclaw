@@ -1,5 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { useFrozenTime, useRealTime } from "../../../test/helpers/extensions/frozen-time.js";
+import { useFrozenTime, useRealTime } from "../../../test/helpers/plugins/frozen-time.js";
 
 const harness = await import("./bot.create-telegram-bot.test-harness.js");
 const {
@@ -256,11 +256,9 @@ describe("createTelegramBot channel_post media", () => {
     });
     sendMessageSpy.mockClear();
     replySpy.mockClear();
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockImplementation(async () =>
-        Promise.reject(new Error("MediaFetchError: Failed to fetch media")),
-      );
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      throw new Error("MediaFetchError: Failed to fetch media");
+    });
 
     try {
       createTelegramBot({ token: "tok" });
