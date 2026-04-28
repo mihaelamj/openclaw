@@ -1,1 +1,0 @@
-mihaela-agents/Rules/ai-agent-rules/rule-loading.md
